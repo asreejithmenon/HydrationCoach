@@ -1,0 +1,215 @@
+//// File: HydrationViewModel.swift
+
+import Foundation
+import SwiftUI
+import Combine
+
+@MainActor
+final class HydrationViewModel: ObservableObject {
+    
+    // MARK: - Published State
+    
+    @Published var userProfile: UserProfile
+    @Published var settings: HydrationSettings
+    @Published var todayLog: HydrationDayLog
+    @Published var recentLogs: [HydrationDayLog]
+    
+    @Published var hasCompletedOnboarding: Bool
+    @Published var latestTip: String
+    @Published var streakCount: Int
+    @Published var unlockedBadges: [Badge]
+    @Published var showCelebration: Bool
+    
+    let allBadges: [Badge] = GamificationEngine.allBadges
+    
+    // MARK: - Dependencies
+    
+    private let persistence = PersistenceManager.shared
+    private let notificationManager = NotificationManager.shared
+    
+    // MARK: - Init
+    
+    init() {
+        let loadedProfile = persistence.loadUserProfile() ?? UserProfile.empty
+        let loadedSettings = persistence.loadSettings() ?? HydrationSettings.defaultSettings()
+        let loadedLogs = persistence.loadLogs() ?? []
+        let onboardingCompleted = persistence.isOnboardingCompleted()
+        
+        var effectiveSettings = loadedSettings
+        let goalMl = HydrationGoalCalculator.calculateGoalMl(for: loadedProfile, unit: loadedSettings.weightUnit)
+        effectiveSettings.dailyGoalMl = goalMl
+        
+        let calendar = Calendar.current
+        let todayStart = calendar.startOfDay(for: Date())
+        var logs = loadedLogs
+        
+        if let existingTodayIndex = logs.firstIndex(where: {
+            calendar.isDate($0.date, inSameDayAs: todayStart)
+        }) {
+            var existing = logs[existingTodayIndex]
+            existing.goalMl = goalMl
+            logs[existingTodayIndex] = existing
+            todayLog = existing
+            recentLogs = logs.filter { !calendar.isDate($0.date, inSameDayAs: todayStart) }
+        } else {
+            todayLog = HydrationDayLog(date: Date(), goalMl: goalMl)
+            recentLogs = logs
+        }
+        
+        self.userProfile = loadedProfile
+        self.settings = effectiveSettings
+        self.hasCompletedOnboarding = onboardingCompleted && loadedProfile.isConfigured
+        self.latestTip = "Log your first glass of water to see a helpful tip."
+        self.streakCount = 0
+        self.unlockedBadges = []
+        self.showCelebration = false
+        
+        refreshForNewDayIfNeeded()
+        recalculateGamification()
+    }
+    
+    // MARK: - Onboarding
+    
+    func completeOnboarding(profile: UserProfile, settings: HydrationSettings) {
+        self.userProfile = profile
+        var updatedSettings = settings
+        let goalMl = HydrationGoalCalculator.calculateGoalMl(for: profile, unit: settings.weightUnit)
+        updatedSettings.dailyGoalMl = goalMl
+        self.settings = updatedSettings
+        
+        let calendar = Calendar.current
+        let today = Date()
+        let todayStart = calendar.startOfDay(for: today)
+        
+        todayLog = HydrationDayLog(date: todayStart, goalMl: goalMl)
+        hasCompletedOnboarding = true
+        latestTip = "You’re all set. Tap a button below to log your first glass."
+        
+        persistence.setOnboardingCompleted(true)
+        saveAll()
+        
+        if settings.remindersEnabled {
+            notificationManager.requestAuthorization { [weak self] granted in
+                guard let self = self else { return }
+                if granted {
+                    self.notificationManager.scheduleHydrationNotifications(settings: self.settings, todayLog: self.todayLog)
+                }
+            }
+        }
+        
+        recalculateGamification()
+    }
+    
+    // MARK: - Daily Rollover
+    
+    func refreshForNewDayIfNeeded() {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        let logDay = calendar.startOfDay(for: todayLog.date)
+        
+        guard logDay != today else {
+            recalculateGamification()
+            return
+        }
+        
+        var logs = recentLogs
+        logs.append(todayLog)
+        
+        logs.sort { $0.startOfDay() < $1.startOfDay() }
+        if logs.count > 30 {
+            logs = Array(logs.suffix(30))
+        }
+        
+        recentLogs = logs
+        
+        let newLog = HydrationDayLog(date: today, goalMl: settings.dailyGoalMl)
+        todayLog = newLog
+        
+        saveAll()
+        recalculateGamification()
+    }
+    
+    // MARK: - Logging
+    
+    func logWater(amountMl: Int) {
+        guard amountMl > 0 else { return }
+        todayLog = todayLog.adding(amountMl: amountMl)
+        latestTip = HydrationTipEngine.tip(for: todayLog)
+        
+        if todayLog.isGoalReached && !showCelebration {
+            triggerCelebration()
+        }
+        
+        saveAll()
+        recalculateGamification()
+        
+        if settings.remindersEnabled {
+            notificationManager.scheduleHydrationNotifications(settings: settings, todayLog: todayLog)
+        }
+    }
+    
+    private func triggerCelebration() {
+        showCelebration = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+            self.showCelebration = false
+        }
+    }
+    
+    // MARK: - Settings
+    
+    func updateSettings(_ newSettings: HydrationSettings) {
+        var updated = newSettings
+        let newGoalMl = HydrationGoalCalculator.calculateGoalMl(for: userProfile, unit: newSettings.weightUnit)
+        updated.dailyGoalMl = newGoalMl
+        settings = updated
+        
+        todayLog.goalMl = newGoalMl
+        
+        saveAll()
+        recalculateGamification()
+        
+        if settings.remindersEnabled {
+            notificationManager.requestAuthorization { [weak self] granted in
+                guard let self = self else { return }
+                if granted {
+                    self.notificationManager.scheduleHydrationNotifications(settings: self.settings, todayLog: self.todayLog)
+                }
+            }
+        } else {
+            notificationManager.cancelAllNotifications()
+        }
+    }
+    
+    // MARK: - Persistence
+    
+    private func saveAll() {
+        persistence.saveUserProfile(userProfile)
+        persistence.saveSettings(settings)
+        
+        var logs = recentLogs
+        logs.append(todayLog)
+        let calendar = Calendar.current
+        var seenDates: Set<Date> = []
+        let uniqueLogs = logs.reversed().filter { log in
+            let day = calendar.startOfDay(for: log.date)
+            if seenDates.contains(day) {
+                return false
+            } else {
+                seenDates.insert(day)
+                return true
+            }
+        }.reversed()
+        
+        persistence.saveLogs(Array(uniqueLogs))
+    }
+    
+    // MARK: - Gamification
+    
+    private func recalculateGamification() {
+        var allLogs = recentLogs
+        allLogs.append(todayLog)
+        streakCount = GamificationEngine.computeStreak(from: allLogs)
+        unlockedBadges = GamificationEngine.unlockedBadges(for: streakCount)
+    }
+}
+
