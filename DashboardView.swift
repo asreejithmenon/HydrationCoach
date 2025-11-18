@@ -132,7 +132,7 @@ struct DashboardView: View {
         .shadow(color: .black.opacity(0.08), radius: 12, x: 0, y: 8)
     }
     
-    /// Main logging card: big, high-contrast quick buttons + a simple "Custom" sheet
+    /// Main logging card: big, high-contrast quick buttons + a simple "Custom" sheet + undo
     private var loggingCard: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Quick log")
@@ -183,6 +183,21 @@ struct DashboardView: View {
                     .cornerRadius(14)
                     .shadow(color: .black.opacity(0.08), radius: 8, x: 0, y: 4)
                 }
+            }
+            
+            // Undo last log (if exists)
+            if !viewModel.todayLog.entries.isEmpty {
+                Button {
+                    viewModel.undoLastLog()
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "arrow.uturn.backward")
+                        Text("Undo last log")
+                    }
+                    .font(.subheadline)
+                    .foregroundColor(.red)
+                }
+                .padding(.top, 4)
             }
         }
         .padding(18)
