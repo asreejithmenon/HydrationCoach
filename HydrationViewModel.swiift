@@ -1,8 +1,7 @@
-//// File: HydrationViewModel.swift
-
 import Foundation
 import SwiftUI
 import Combine
+
 
 @MainActor
 final class HydrationViewModel: ObservableObject {
@@ -30,44 +29,64 @@ final class HydrationViewModel: ObservableObject {
     // MARK: - Init
     
     init() {
+        // 1. Load saved data (no self access)
         let loadedProfile = persistence.loadUserProfile() ?? UserProfile.empty
         let loadedSettings = persistence.loadSettings() ?? HydrationSettings.defaultSettings()
         let loadedLogs = persistence.loadLogs() ?? []
         let onboardingCompleted = persistence.isOnboardingCompleted()
-        
+
+        // 2. Compute goal
         var effectiveSettings = loadedSettings
         let goalMl = HydrationGoalCalculator.calculateGoalMl(for: loadedProfile, unit: loadedSettings.weightUnit)
         effectiveSettings.dailyGoalMl = goalMl
-        
+
+        // 3. Today vs history
         let calendar = Calendar.current
         let todayStart = calendar.startOfDay(for: Date())
+
         var logs = loadedLogs
-        
-        if let existingTodayIndex = logs.firstIndex(where: {
+        let todaysLog: HydrationDayLog
+        let recent: [HydrationDayLog]
+
+        if let existingIndex = logs.firstIndex(where: {
             calendar.isDate($0.date, inSameDayAs: todayStart)
         }) {
-            var existing = logs[existingTodayIndex]
+            var existing = logs[existingIndex]
             existing.goalMl = goalMl
-            logs[existingTodayIndex] = existing
-            todayLog = existing
-            recentLogs = logs.filter { !calendar.isDate($0.date, inSameDayAs: todayStart) }
+            todaysLog = existing
+
+            // FIX: no isSameDay(as:) → use calendar
+            recent = logs.filter { log in
+                !calendar.isDate(log.startOfDay(), inSameDayAs: todayStart)
+            }
         } else {
-            todayLog = HydrationDayLog(date: Date(), goalMl: goalMl)
-            recentLogs = logs
+            todaysLog = HydrationDayLog(date: todayStart, goalMl: goalMl)
+            recent = logs
         }
-        
+
+        // 4. Assign stored properties (safe point to use self)
         self.userProfile = loadedProfile
         self.settings = effectiveSettings
+        self.todayLog = todaysLog
+        self.recentLogs = recent
         self.hasCompletedOnboarding = onboardingCompleted && loadedProfile.isConfigured
-        self.latestTip = "Log your first glass of water to see a helpful tip."
         self.streakCount = 0
         self.unlockedBadges = []
         self.showCelebration = false
-        
+
+        // 5. Compute tip (safe now)
+        if todaysLog.entries.isEmpty {
+            self.latestTip = "Log your first glass of water to see how today’s hydration is shaping up."
+        } else {
+            self.latestTip = HydrationTipEngine.tip(for: todaysLog, recentLogs: recent)
+        }
+
+        // 6. Rollover + streak/badges
         refreshForNewDayIfNeeded()
         recalculateGamification()
     }
-    
+
+
     // MARK: - Onboarding
     
     func completeOnboarding(profile: UserProfile, settings: HydrationSettings) {
@@ -83,7 +102,7 @@ final class HydrationViewModel: ObservableObject {
         
         todayLog = HydrationDayLog(date: todayStart, goalMl: goalMl)
         hasCompletedOnboarding = true
-        latestTip = "You’re all set. Tap a button below to log your first glass."
+        latestTip = "You’re all set. Log your first glass and I’ll keep track of your day."
         
         persistence.setOnboardingCompleted(true)
         saveAll()
@@ -112,6 +131,7 @@ final class HydrationViewModel: ObservableObject {
             return
         }
         
+        // Archive old todayLog
         var logs = recentLogs
         logs.append(todayLog)
         
@@ -122,8 +142,11 @@ final class HydrationViewModel: ObservableObject {
         
         recentLogs = logs
         
+        // New log for today
         let newLog = HydrationDayLog(date: today, goalMl: settings.dailyGoalMl)
         todayLog = newLog
+        
+        latestTip = "New day, fresh start. Log your first glass when you’re ready."
         
         saveAll()
         recalculateGamification()
@@ -134,10 +157,37 @@ final class HydrationViewModel: ObservableObject {
     func logWater(amountMl: Int) {
         guard amountMl > 0 else { return }
         todayLog = todayLog.adding(amountMl: amountMl)
-        latestTip = HydrationTipEngine.tip(for: todayLog)
+        latestTip = HydrationTipEngine.tip(for: todayLog, recentLogs: recentLogs)
         
         if todayLog.isGoalReached && !showCelebration {
             triggerCelebration()
+        }
+        
+        saveAll()
+        recalculateGamification()
+        
+        if settings.remindersEnabled {
+            notificationManager.scheduleHydrationNotifications(settings: settings, todayLog: todayLog)
+        }
+    }
+    
+    /// Undo the last hydration entry for today, if any.
+    func undoLastLog() {
+        guard !todayLog.entries.isEmpty else { return }
+        
+        var updatedLog = todayLog
+        let removed = updatedLog.entries.removeLast()
+        updatedLog.totalIntakeMl = max(0, updatedLog.totalIntakeMl - removed.amountMl)
+        todayLog = updatedLog
+        
+        if todayLog.entries.isEmpty {
+            latestTip = "Last log removed. Add a glass whenever you’re ready to start again today."
+        } else {
+            latestTip = HydrationTipEngine.tip(for: todayLog, recentLogs: recentLogs)
+        }
+        
+        if !todayLog.isGoalReached {
+            showCelebration = false
         }
         
         saveAll()
@@ -163,7 +213,14 @@ final class HydrationViewModel: ObservableObject {
         updated.dailyGoalMl = newGoalMl
         settings = updated
         
+        // Update today’s goal to new value
         todayLog.goalMl = newGoalMl
+        
+        if todayLog.entries.isEmpty {
+            latestTip = "Your settings are updated. Log a glass to start today’s progress."
+        } else {
+            latestTip = HydrationTipEngine.tip(for: todayLog, recentLogs: recentLogs)
+        }
         
         saveAll()
         recalculateGamification()
@@ -212,4 +269,3 @@ final class HydrationViewModel: ObservableObject {
         unlockedBadges = GamificationEngine.unlockedBadges(for: streakCount)
     }
 }
-
