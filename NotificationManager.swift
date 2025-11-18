@@ -1,11 +1,3 @@
-//
-//  NotificationManager.swift
-//  HydrationCoach
-//
-//  Created by Sreejith Menon on 11/16/25.
-//
-
-
 // File: NotificationManager.swift
 
 import Foundation
@@ -28,10 +20,8 @@ final class NotificationManager {
         UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
     }
     
-    /// Schedules local notifications between wake and sleep times at a fixed interval.
-    /// Note: The notification body uses the current day's progress at the time of scheduling,
-    /// because local notifications can't dynamically read your live hydration progress later
-    /// without additional extensions.
+    /// Schedules local notifications between wake and sleep times.
+    /// Uses SmartReminderEngine to adapt frequency and message based on how on-track the user is.
     func scheduleHydrationNotifications(settings: HydrationSettings, todayLog: HydrationDayLog) {
         guard settings.remindersEnabled else { return }
         
@@ -67,20 +57,31 @@ final class NotificationManager {
         }
         
         if sleepDate <= wakeDate {
-            // If times are inverted, just skip scheduling to avoid weird behavior.
+            // If times are inverted, skip scheduling to avoid weird behavior.
             return
         }
         
-        let interval = TimeInterval(settings.reminderFrequencyMinutes * 60)
+        let expectedProgress = SmartReminderEngine.expectedProgressFraction(settings: settings, now: now)
+        let adjustedMinutes = SmartReminderEngine.adjustedFrequencyMinutes(
+            baseFrequency: settings.reminderFrequencyMinutes,
+            settings: settings,
+            todayLog: todayLog,
+            now: now
+        )
+        
+        let interval = TimeInterval(adjustedMinutes * 60)
+        let message = SmartReminderEngine.message(
+            forProgress: todayLog.progress,
+            expectedProgress: expectedProgress
+        )
         
         var currentFireDate = wakeDate
-        let progressPercent = Int(todayLog.progress * 100)
         
         while currentFireDate < sleepDate {
             if currentFireDate > now {
                 let content = UNMutableNotificationContent()
                 content.title = "Hydration reminder"
-                content.body = "You’re at about \(progressPercent)% of your goal today. Time for a sip?"
+                content.body = message
                 content.sound = UNNotificationSound.default
                 
                 let triggerDateComponents = calendar.dateComponents(
@@ -101,3 +102,5 @@ final class NotificationManager {
         }
     }
 }
+
+
